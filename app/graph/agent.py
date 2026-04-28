@@ -3,8 +3,10 @@ CropEye Agent powered by Groq (llama-3.1-8b-instant).
 - Uses Llama 3.1 8B Instant via Groq API as the LLM
 - Keeps in-process chat history per (session_id, plot_id)
 - Calls backend API tools based on user intent
+- Follow-up aware: caches last tool data so context carries across messages
 - Multilingual: auto-detects and responds in Hindi/Marathi/Kannada/English
 """
+import logging
 import re
 from dataclasses import dataclass
 
@@ -23,6 +25,8 @@ from app.tools.api_tools import (
     get_water_uptake_map,
     get_weather,
 )
+
+logger = logging.getLogger("cropeye.agent")
 
 SYSTEM_PROMPT = f"""You are **CropEye Assistant** — a smart, friendly AI chatbot for Indian farmers using the CropEye precision farming app.
 
@@ -45,19 +49,27 @@ You help farmers:
 {CROPEYE_APP_KNOWLEDGE}
 
 ## When to Use Tools
-- User asks about water / irrigation / water map → call get_water_uptake_map
+- User asks about water / irrigation / water map → get_water_uptake_map
   → Returns: deficient%, less%, adequate%, excellent%, excess% pixel distribution
-- User asks about crop health / NDVI / vegetation / growth map → call get_growth_map
+- User asks about crop health / NDVI / vegetation / growth map → get_growth_map
   → Returns: healthy%, moderate%, weak%, stress% pixel distribution
-- User asks about pests / pest map / fungal / chewing / sucking → call get_pest_map
+- User asks about pests / pest map / fungal / chewing / sucking → get_pest_map
   → Returns: chewing%, fungi%, sucking%, wilt%, SoilBorn% affected pixels
-- User asks about soil moisture trend / history / last 7 days → call get_soil_moisture
+- User asks about soil moisture trend / history / last 7 days → get_soil_moisture
   → Returns: daily moisture%, rainfall mm, ET mm for each of the last 7 days
-- User asks about soil moisture map / soil zones / moisture distribution → call get_soil_moisture_map
+- User asks about soil moisture map / soil zones / moisture distribution → get_soil_moisture_map
   → Returns: less%, adequate%, excellent%, excess%, shallow_water% pixel distribution
-- User asks about NPK / fertilizer / nutrients → call get_nutrient_analysis
-- User asks about weather / temperature → call get_weather (need lat/lon from context)
-- User asks about field details → call get_plot_info
+- User asks about NPK / fertilizer / nutrients → get_nutrient_analysis
+- User asks about weather / temperature → get_weather (need lat/lon from context)
+- User asks about field details → get_plot_info
+
+## Conversation & Follow-Up Rules (IMPORTANT)
+- The conversation history and previously fetched field data are provided to you
+- For follow-up questions (e.g. "what will happen if it increases?", "is that good?",
+  "what should I do?"), use the [Previous Field Data] already provided — do NOT say
+  you need more information
+- Always connect follow-up answers to the actual numbers from the previous data
+- Be conversational — remember what was discussed earlier in this chat
 
 ## Response Style
 - Be conversational and warm — talk like a helpful farming expert friend
@@ -104,56 +116,80 @@ def _extract_lat_lon(full_message: str) -> tuple[float | None, float | None]:
     return float(match.group(1)), float(match.group(2))
 
 
+def _recent_user_text(history: list, n: int = 3) -> str:
+    """Concatenate last n user messages to detect active topic for follow-ups."""
+    msgs = [m.content.lower() for m in history if isinstance(m, HumanMessage)]
+    return " ".join(msgs[-n:])
+
+
 class CropEyeAgent:
     def __init__(self) -> None:
         self._history: dict[str, list] = {}
+        # Caches the last fetched tool data per thread for follow-up awareness
+        self._tool_context: dict[str, str] = {}
         self._client = AsyncGroq(api_key=settings.groq_api_key)
 
-    async def _run_tools(self, user_question: str, full_message: str, plot_id: str) -> tuple[list[str], list[str]]:
+    async def _run_tools(
+        self,
+        user_question: str,
+        full_message: str,
+        plot_id: str,
+        history: list,
+    ) -> tuple[list[str], list[str]]:
         q = user_question.lower()
+
+        # For ambiguous/short follow-up messages, also scan recent history
+        # to detect the active topic (e.g. "what if it increases?" after moisture Q)
+        recent_context = _recent_user_text(history, n=3)
+        q_with_context = f"{q} {recent_context}"
+
         called_tools: list[str] = []
         tool_results: list[str] = []
 
-        def should_call(words: list[str]) -> bool:
+        def in_current(words: list[str]) -> bool:
+            """Match keywords in current message only — for fresh data triggers."""
             return any(w in q for w in words)
 
-        # ── Soil Moisture MAP (pixel classification) ──────────────────────
-        # Check this BEFORE the broader water/irrigation check to avoid double-calling
-        if should_call(["soil moisture map", "soil map", "moisture map",
-                        "moisture distribution", "moisture zone", "soil zone",
-                        "how much field is dry", "how much field is wet"]):
+        def in_context(words: list[str]) -> bool:
+            """Match keywords across current + recent history — for topic continuation."""
+            return any(w in q_with_context for w in words)
+
+        # ── Soil Moisture MAP ─────────────────────────────────────────────
+        if in_current(["soil moisture map", "soil map", "moisture map",
+                       "moisture distribution", "moisture zone", "soil zone",
+                       "how much field is dry", "how much field is wet"]):
             called_tools.append("get_soil_moisture_map")
             tool_results.append(await get_soil_moisture_map.ainvoke({"plot_id": plot_id}))
 
-        # ── Water Uptake MAP (irrigation depth) ───────────────────────────
-        elif should_call(["water", "irrig", "ndwi", "water uptake", "water map",
-                          "field water", "is my field dry", "do i need to water"]):
+        # ── Water Uptake MAP ──────────────────────────────────────────────
+        elif in_current(["water", "irrig", "ndwi", "water uptake", "water map",
+                         "field water", "is my field dry", "do i need to water"]):
             called_tools.append("get_water_uptake_map")
             tool_results.append(await get_water_uptake_map.ainvoke({"plot_id": plot_id}))
 
-        # ── Growth MAP (NDVI / crop health) ───────────────────────────────
-        if should_call(["ndvi", "growth", "vegetation", "crop health", "healthy crop",
-                        "growth map", "crop stress", "how are my crops", "field health"]):
+        # ── Growth MAP ────────────────────────────────────────────────────
+        if in_current(["ndvi", "growth", "vegetation", "crop health", "healthy crop",
+                       "growth map", "crop stress", "how are my crops", "field health"]):
             called_tools.append("get_growth_map")
             tool_results.append(await get_growth_map.ainvoke({"plot_id": plot_id}))
 
-        # ── Pest Detection MAP ─────────────────────────────────────────────
-        if should_call(["pest", "insect", "bug", "aphid", "whitefly", "fungal",
-                        "fungi", "chewing", "sucking", "wilt", "pest map", "pest risk"]):
+        # ── Pest MAP ──────────────────────────────────────────────────────
+        if in_current(["pest", "insect", "bug", "aphid", "whitefly", "fungal",
+                       "fungi", "chewing", "sucking", "wilt", "pest map", "pest risk"]):
             called_tools.append("get_pest_map")
             tool_results.append(await get_pest_map.ainvoke({"plot_id": plot_id}))
 
-        # ── Soil Moisture TREND (7-day history) ───────────────────────────
-        if should_call(["soil moisture", "moisture history", "last week moisture",
-                        "7 day moisture", "moisture trend", "moisture level",
-                        "soil water level", "moisture graph"]):
+        # ── Soil Moisture TREND ───────────────────────────────────────────
+        if in_current(["soil moisture", "moisture history", "last week moisture",
+                       "7 day moisture", "moisture trend", "moisture level",
+                       "soil water level", "moisture graph"]):
             if "get_soil_moisture_map" not in called_tools:
                 called_tools.append("get_soil_moisture")
                 tool_results.append(await get_soil_moisture.ainvoke({"plot_id": plot_id}))
 
-        # ── NPK / Nutrients ────────────────────────────────────────────────
-        if should_call(["npk", "nitrogen", "phosphorus", "potassium", "fertilizer",
-                        "nutrient", "urea", "dap", "soil fertility", "soil nutrient"]):
+        # ── NPK / Nutrients ───────────────────────────────────────────────
+        if in_current(["npk", "nitrogen", "phosphorus", "potassium", "fertilizer",
+                       "nutrient", "urea", "dap", "soil fertility", "soil nutrient"]):
             plantation_date = _extract_context_value(full_message, "Plantation date")
             called_tools.append("get_nutrient_analysis")
             tool_results.append(
@@ -163,16 +199,16 @@ class CropEyeAgent:
             )
 
         # ── Weather ───────────────────────────────────────────────────────
-        if should_call(["weather", "temperature", "rain", "wind", "humidity", "forecast",
-                        "spray today", "going to rain"]):
+        if in_current(["weather", "temperature", "rain", "wind", "humidity", "forecast",
+                       "spray today", "going to rain"]):
             lat, lon = _extract_lat_lon(full_message)
             if lat is not None and lon is not None:
                 called_tools.append("get_weather")
                 tool_results.append(await get_weather.ainvoke({"lat": lat, "lon": lon}))
 
-        # ── Plot / Field Info ──────────────────────────────────────────────
-        if should_call(["plot", "field details", "field info", "my field",
-                        "plantation date", "field area", "crop name"]):
+        # ── Plot / Field Info ─────────────────────────────────────────────
+        if in_current(["plot", "field details", "field info", "my field",
+                       "plantation date", "field area", "crop name"]):
             called_tools.append("get_plot_info")
             tool_results.append(await get_plot_info.ainvoke({"plot_id": plot_id, "access_token": ""}))
 
@@ -182,6 +218,7 @@ class CropEyeAgent:
         messages = payload.get("messages", [])
         if not messages:
             return {"messages": []}
+
         human_message = messages[-1]
         thread_id = config.get("configurable", {}).get("thread_id", "default")
         plot_id = thread_id.split("::", 1)[1] if "::" in thread_id else ""
@@ -190,32 +227,56 @@ class CropEyeAgent:
         history.append(HumanMessage(content=human_message.content))
 
         user_question = _extract_user_question(human_message.content)
-        called_tools, tool_outputs = await self._run_tools(user_question, human_message.content, plot_id)
 
-        prior_turns = []
-        for m in history[:-1]:
-            role = "User" if isinstance(m, HumanMessage) else "Assistant"
-            prior_turns.append(f"{role}: {m.content}")
-        convo_text = "\n".join(prior_turns[-10:])
-        tool_text = "\n\n".join(tool_outputs) if tool_outputs else "No external tool used."
-
-        user_content = (
-            f"Conversation so far:\n{convo_text or 'No prior messages.'}\n\n"
-            f"Current user question:\n{user_question}\n\n"
-            f"Relevant tool outputs:\n{tool_text}\n"
+        # Pass history (before current msg) to tool runner for topic detection
+        called_tools, tool_outputs = await self._run_tools(
+            user_question, human_message.content, plot_id, history[:-1]
         )
+
+        # ── Update or reuse tool context ──────────────────────────────────
+        if tool_outputs:
+            # Fresh data fetched — update cache
+            self._tool_context[thread_id] = "\n\n".join(tool_outputs)
+            tool_section = f"[Live Field Data — just fetched]\n{self._tool_context[thread_id]}"
+            logger.info("[AGENT] Fresh tool data fetched: %s", called_tools)
+        elif thread_id in self._tool_context:
+            # Follow-up: reuse last fetched data so LLM can answer in context
+            tool_section = f"[Previous Field Data — use this for the follow-up question]\n{self._tool_context[thread_id]}"
+            logger.info("[AGENT] Follow-up detected — reusing cached tool context")
+        else:
+            tool_section = "No field data available yet for this session."
+
+        # ── Build proper multi-turn Groq messages ─────────────────────────
+        # System prompt first, then last 4 turns (8 msgs) as user/assistant pairs,
+        # then current question with field data attached
+        groq_messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        recent_history = history[:-1][-8:]  # last 4 turns before current message
+        for m in recent_history:
+            if isinstance(m, HumanMessage):
+                groq_messages.append({"role": "user", "content": _extract_user_question(m.content)})
+            elif isinstance(m, AIMessage):
+                groq_messages.append({"role": "assistant", "content": m.content})
+
+        # Current message with field data appended
+        current_content = f"{user_question}\n\n{tool_section}"
+        groq_messages.append({"role": "user", "content": current_content})
 
         response = await self._client.chat.completions.create(
             model=settings.groq_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_content},
-            ],
+            messages=groq_messages,
             temperature=0.3,
             max_tokens=2048,
         )
         answer = response.choices[0].message.content or "Sorry, I could not process your request."
-        ai_msg = AIMessage(content=answer, tool_calls=[{"name": t, "args": {}, "id": t, "type": "tool_call"} for t in called_tools])
+
+        ai_msg = AIMessage(
+            content=answer,
+            tool_calls=[
+                {"name": t, "args": {}, "id": t, "type": "tool_call"}
+                for t in called_tools
+            ],
+        )
         history.append(ai_msg)
         return {"messages": history}
 
@@ -239,7 +300,5 @@ def get_agent() -> CropEyeAgent:
 
 
 def get_thread_config(session_id: str, plot_id: str) -> dict:
-    """
-    Each (session_id, plot_id) pair gets its own isolated memory thread.
-    """
+    """Each (session_id, plot_id) pair gets its own isolated memory thread."""
     return {"configurable": {"thread_id": f"{session_id}::{plot_id}"}}
