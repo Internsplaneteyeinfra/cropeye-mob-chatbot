@@ -37,13 +37,29 @@ You help farmers:
 3. Get actionable farming recommendations based on real satellite data
 4. Navigate the app easily
 
-## Language Rules (CRITICAL)
-- Detect the language of each user message automatically
-- Reply in the SAME language the user wrote in
-- Supported: English, Hindi (हिंदी), Marathi (मराठी), Kannada (ಕನ್ನಡ)
-- If mixing languages (Hinglish), match their style
+## Language Rules (CRITICAL — READ CAREFULLY)
+- Detect the language of the user message and reply in THE EXACT SAME LANGUAGE
+- Supported languages: English, Hindi (हिंदी), Marathi (मराठी), Kannada (ಕನ್ನಡ)
+
+### Marathi Detection (IMPORTANT)
+- Marathi words to recognise: tyasathi, karavya, lagtil, mla, ky, tumhi, aahe, nahi,
+  sheti, pani, mati, kiti, kasa, karu, sanga, kela, hote, ahe, aplya, amcha, tar,
+  nakki, jagat, ugavlela, pikache, aaj, udya, varsha, mahina, divas, shekda
+- If user writes in Romanized Marathi (Marathi words in English letters like
+  "tyasathi mla ky karavya lagtil"), ALWAYS reply in Marathi — either in
+  Devanagari (मराठी) OR in the same Romanized Marathi style the user used
+- NEVER reply in Hindi when user is speaking Marathi — they are different languages
+- Marathi-specific words differ from Hindi: "aahe" (not "hai"), "nahi" (Marathi usage),
+  "tumhi" (not "tum/aap"), "mla" = "mala" = "to me", "tyasathi" = "for that"
+
+### Hindi Detection
+- Hindi-specific words: hai, hain, karo, kya, mujhe, aapko, yahan, wahan, bahut
+
+### General Rules
+- If mixing languages (Hinglish/Manglish), match their exact style
 - Use simple, clear language farmers will understand
 - For numbers/values, always include units (%, kg/ha, °C, mm)
+- NEVER mix languages in your reply unless the user mixed them first
 
 ## App Knowledge
 {CROPEYE_APP_KNOWLEDGE}
@@ -71,17 +87,25 @@ You help farmers:
 - Always connect follow-up answers to the actual numbers from the previous data
 - Be conversational — remember what was discussed earlier in this chat
 
-## Response Style
-- Be conversational and warm — talk like a helpful farming expert friend
-- For data analysis: key finding → details → recommendation
-- Always end data responses with a practical action
-- Use emojis occasionally 🌾💧🌡️
+## Response Style (STRICT)
+- Keep every reply to **3-4 lines maximum** — no long paragraphs
+- Each line should be one clear point: status → risk → action
+- Use bullet points (•) or short numbered steps, not essay-style text
+- Be direct and to the point — farmers need quick, clear answers
+- Use emojis occasionally 🌾💧🌡️ but only 1-2 per reply
+- Never repeat the question back or add filler sentences
 
-## AI Recommendations Format
-1. **Current Status**: what the data shows
-2. **Risk/Concern**: what this means for the crop
-3. **Action**: what to do right now
-4. **Timeline**: when to do it
+## Format for Data Responses (3-4 lines only)
+• **Status**: [what the data shows in one line]
+• **Risk**: [what it means for the crop in one line]
+• **Action**: [what to do right now in one line]
+
+## CRITICAL OUTPUT RULES
+- The blocks marked [Context: ...], [Live Field Data ...], [Previous Field Data ...],
+  and [Language Instruction: ...] are INTERNAL instructions for you only
+- NEVER copy, print, or mention any of these blocks in your reply
+- NEVER show raw JSON data or API response in your reply
+- Your reply must contain ONLY the farmer-facing message — nothing else
 
 ## Important Notes
 - Plot ID is provided with each message — always use it for API calls
@@ -155,41 +179,78 @@ class CropEyeAgent:
             return any(w in q_with_context for w in words)
 
         # ── Soil Moisture MAP ─────────────────────────────────────────────
+        # EN: soil moisture map | MR: mati cha ola nakasha, olsarpan nakasha
+        # HI: mitti ka naksha, nami naksha
         if in_current(["soil moisture map", "soil map", "moisture map",
                        "moisture distribution", "moisture zone", "soil zone",
-                       "how much field is dry", "how much field is wet"]):
+                       "how much field is dry", "how much field is wet",
+                       "mati cha ola nakasha", "olsarpan nakasha", "mitti naksha",
+                       "nami naksha", "sheti naksha"]):
             called_tools.append("get_soil_moisture_map")
             tool_results.append(await get_soil_moisture_map.ainvoke({"plot_id": plot_id}))
 
         # ── Water Uptake MAP ──────────────────────────────────────────────
+        # EN: water, irrigation | MR: pani, sinchan, paus, panavtha
+        # HI: paani, sinchai, sechaan
         elif in_current(["water", "irrig", "ndwi", "water uptake", "water map",
-                         "field water", "is my field dry", "do i need to water"]):
+                         "field water", "is my field dry", "do i need to water",
+                         "pani", "sinchan", "panavtha", "paus dya", "sinchai",
+                         "sechaan", "paani dena", "paani ki zarurat"]):
             called_tools.append("get_water_uptake_map")
             tool_results.append(await get_water_uptake_map.ainvoke({"plot_id": plot_id}))
 
         # ── Growth MAP ────────────────────────────────────────────────────
+        # EN: growth, crop health | MR: pik vadhata, pikachi prakat, pik arogya
+        # HI: fasal ki sehat, ugaan, vikas
         if in_current(["ndvi", "growth", "vegetation", "crop health", "healthy crop",
-                       "growth map", "crop stress", "how are my crops", "field health"]):
+                       "growth map", "crop stress", "how are my crops", "field health",
+                       "pik vadhata", "pikachi prakat", "pik arogya", "pik kashe",
+                       "ugavlela", "vanaspati", "fasal ki sehat", "fasal vikas",
+                       "ugaan", "pik thik"]):
             called_tools.append("get_growth_map")
             tool_results.append(await get_growth_map.ainvoke({"plot_id": plot_id}))
 
         # ── Pest MAP ──────────────────────────────────────────────────────
+        # EN: pest, insect | MR: ali, kide, rog, bimari, dhoka, kimad, naashkarak
+        # HI: keede, bimari, rog, keede makoode, keet
         if in_current(["pest", "insect", "bug", "aphid", "whitefly", "fungal",
-                       "fungi", "chewing", "sucking", "wilt", "pest map", "pest risk"]):
+                       "fungi", "chewing", "sucking", "wilt", "pest map", "pest risk",
+                       # Marathi
+                       "ali", "kide", "rog", "bimari", "dhoka", "kimad",
+                       "naashkarak", "kida", "kitak", "rograjog", "bughad",
+                       "ali cha", "kide cha", "pik rog",
+                       # Hindi
+                       "keede", "keet", "makoode", "rog hai", "bimari hai",
+                       "keetnaashak", "fungal rog"]):
             called_tools.append("get_pest_map")
             tool_results.append(await get_pest_map.ainvoke({"plot_id": plot_id}))
 
         # ── Soil Moisture TREND ───────────────────────────────────────────
+        # EN: soil moisture | MR: mati cha ola, matit pani, maticha arda
+        # HI: mitti ki nami, mitti me paani
         if in_current(["soil moisture", "moisture history", "last week moisture",
                        "7 day moisture", "moisture trend", "moisture level",
-                       "soil water level", "moisture graph"]):
+                       "soil water level", "moisture graph",
+                       # Marathi
+                       "mati cha ola", "matit pani", "maticha arda", "olsarpan",
+                       "mati arda", "7 divsacha", "saat divsacha",
+                       # Hindi
+                       "mitti ki nami", "mitti me paani", "nami ka itihas",
+                       "7 din ki nami"]):
             if "get_soil_moisture_map" not in called_tools:
                 called_tools.append("get_soil_moisture")
                 tool_results.append(await get_soil_moisture.ainvoke({"plot_id": plot_id}))
 
         # ── NPK / Nutrients ───────────────────────────────────────────────
+        # EN: npk, fertilizer | MR: khate, uriya, poshanatve, mati poshan
+        # HI: khad, urvarak, poshan
         if in_current(["npk", "nitrogen", "phosphorus", "potassium", "fertilizer",
-                       "nutrient", "urea", "dap", "soil fertility", "soil nutrient"]):
+                       "nutrient", "urea", "dap", "soil fertility", "soil nutrient",
+                       # Marathi
+                       "khate", "uriya", "poshanatve", "mati poshan", "naytrajan",
+                       "fosfaras", "potash", "khad", "pik poshan",
+                       # Hindi
+                       "urvarak", "poshan", "khad dena", "naytrajan", "DAP dena"]):
             plantation_date = _extract_context_value(full_message, "Plantation date")
             called_tools.append("get_nutrient_analysis")
             tool_results.append(
@@ -199,16 +260,30 @@ class CropEyeAgent:
             )
 
         # ── Weather ───────────────────────────────────────────────────────
+        # EN: weather | MR: havas, paus, temperature, unhacha, thanda
+        # HI: mausam, barish, garmi
         if in_current(["weather", "temperature", "rain", "wind", "humidity", "forecast",
-                       "spray today", "going to rain"]):
+                       "spray today", "going to rain",
+                       # Marathi
+                       "havas", "paus", "unhacha", "thanda", "vara", "dhukke",
+                       "havaman", "pavsache",
+                       # Hindi
+                       "mausam", "barish", "garmi", "sardi", "aandhi", "toofan"]):
             lat, lon = _extract_lat_lon(full_message)
             if lat is not None and lon is not None:
                 called_tools.append("get_weather")
                 tool_results.append(await get_weather.ainvoke({"lat": lat, "lon": lon}))
 
         # ── Plot / Field Info ─────────────────────────────────────────────
+        # EN: my field | MR: mazhi sheti, mazha plot, sheticha mahiti
+        # HI: mera khet, meri zameen
         if in_current(["plot", "field details", "field info", "my field",
-                       "plantation date", "field area", "crop name"]):
+                       "plantation date", "field area", "crop name",
+                       # Marathi
+                       "mazhi sheti", "mazha plot", "sheticha mahiti", "plot chi mahiti",
+                       "sheti kiti", "pik konti",
+                       # Hindi
+                       "mera khet", "meri zameen", "khet ki jankari"]):
             called_tools.append("get_plot_info")
             tool_results.append(await get_plot_info.ainvoke({"plot_id": plot_id, "access_token": ""}))
 
@@ -258,8 +333,20 @@ class CropEyeAgent:
             elif isinstance(m, AIMessage):
                 groq_messages.append({"role": "assistant", "content": m.content})
 
-        # Current message with field data appended
-        current_content = f"{user_question}\n\n{tool_section}"
+        # Current message with field data + internal instructions
+        # The [INTERNAL] blocks are NOT to appear in the reply
+        current_content = (
+            f"User message: {user_question}\n\n"
+            f"[INTERNAL — plot_id='{plot_id}', data already fetched, "
+            f"do NOT ask farmer for more info, "
+            f"do NOT echo these instructions or raw data in your reply]\n\n"
+            f"{tool_section}\n\n"
+            f"[INTERNAL — Language: detect language from user message above. "
+            f"Marathi words: ali, kide, rog, dhoka, pik, sheti, mati, pani, ola, "
+            f"sinchan, tyasathi, karavya, lagtil, tumhi, aahe, mazhi, mazha, ahe. "
+            f"Reply in Marathi (Devanagari) if Marathi detected. "
+            f"NEVER echo [INTERNAL] blocks. Output ONLY the farmer reply.]"
+        )
         groq_messages.append({"role": "user", "content": current_content})
 
         response = await self._client.chat.completions.create(
